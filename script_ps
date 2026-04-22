@@ -1,0 +1,193 @@
+# SCRIPT PARA MONITORAMENTO DE INTEGRIDADE E DETECÇÃO COMPORTAMENTAL 
+# Testado no PowerShell 5.1
+# Customizar o caminho do diretório, e onde ficará o registro de logs e baseline dos hashs
+
+# >> CONFIGURAÇÕES GLOBAIS <<
+$directory = "C:\"
+$global:baselinePath = "C:\"
+$global:logFile = "C:\"
+$global:suspiciousExtensions = @(".locked", ".crypt", ".enc", ".aes")
+
+# Controle de Flood e Comportamento
+$global:lastEventTime = @{}        # Evita duplicatas
+$global:eventCounter = 0           # Contador de modificações rápidas
+$global:lastReset = Get-Date
+
+Add-Type -AssemblyName System.Windows.Forms
+
+# >> Variaveis/FUNÇÕES <<
+
+$global:WriteLog = {
+    param($msg, $level)
+
+    $data = Get-Date -Format "dd/MM/yyyy HH:mm:ss"
+    $line = "[$data] [$level] $msg"
+
+    Add-Content -Path $global:logFile -Value $line -Encoding Default
+}
+
+$global:GetFileHashSafe = {
+    param($path)
+
+    if (!(Test-Path $path) -or (Test-Path $path -PathType Container)) { return $null }
+    try {
+        return (Get-FileHash -Path $path -Algorithm SHA256).Hash
+    } catch { return $null }
+}
+
+# >> LÓGICA DE DETECÇÃO DE ATAQUE <<
+function Check-BehavioralAnomaly {
+    $now = Get-Date
+    $global:eventCounter++
+
+    # Se houver mais de 10 modificações em menos de 5 segundos...
+    if ($global:eventCounter -gt 10) {
+        $span = ($now - $global:lastReset).TotalSeconds
+        if ($span -lt 5) {
+            & $global:WriteLog "< POSSÍVEL ATAQUE EM MASSA DETECTADO ($global:eventCounter eventos em $span s) >" "CRITICAL"
+            [System.Media.SystemSounds]::Hand.Play()
+            # Aqui seria possível adicionar um IPs
+        }
+        $global:eventCounter = 0
+        $global:lastReset = $now
+    }
+}
+
+# >> INICIALIZAÇÃO <<
+$global:baseline = @{}
+if (Test-Path $global:baselinePath) {
+    $content = Get-Content $global:baselinePath -Raw
+    if ($content) { 
+	$temp = $content | ConvertFrom-Json
+	$global:baseline = @{}
+
+	foreach ($key in $temp.PSObject.Properties.Name) {
+    	$global:baseline[$key] = $temp.$key
+	}
+    }
+    & $global:WriteLog "Baseline carregado." "INFO"
+}else {
+    & $global:WriteLog "Criando baseline inicial..." "INFO"
+    Get-ChildItem -Path $directory -Recurse -File | ForEach-Object {
+        $hash = Get-FileHashSafe $_.FullName
+        if ($hash) {
+            $global:baseline[$_.FullName] = $hash
+        }
+    }
+}
+
+# >> WATCHER <<
+$watcher = New-Object System.IO.FileSystemWatcher
+$watcher.Path = $directory
+$watcher.IncludeSubdirectories = $true
+$watcher.EnableRaisingEvents = $true
+$watcher.NotifyFilter = [System.IO.NotifyFilters]'FileName, LastWrite, Size'
+
+# >> PROCESSAMENTO DE EVENTOS <<
+$action = {
+    try{
+    	$path = $Event.SourceEventArgs.FullPath
+    	$type = $Event.SourceEventArgs.ChangeType
+    	$now = Get-Date
+	
+    	# Filtro de Ruído e Arquivos Temporários
+    	if ($path -like "*.tmp" -or $path -like "~*" -or $path -eq $global:baselinePath) { return }
+
+    	# Controle de Duplicatas (Cooldown de 1s por arquivo)
+    	if ($global:lastEventTime[$path] -and ($now - $global:lastEventTime[$path]).TotalSeconds -lt 1) { return }
+    	$global:lastEventTime[$path] = $now
+
+    	# Verificação de Extensão (Criar e Renomear)
+    	$ext = [System.IO.Path]::GetExtension($path)
+    	if ($global:suspiciousExtensions -contains $ext) {
+        	& $global:WriteLog "EXTENSÃO SUSPEITA: $path" "CRITICAL"
+		      Write-Host "EVENTO: $type - $path" -ForegroundColor Magenta
+        	return 
+    	}
+
+    	# Processamento por Tipo
+    	switch ($type) {
+            "Created" {
+            	  $hash = & $global:GetFileHashSafe $path
+            	  $global:baseline[$path] = $hash
+            	  & $global:WriteLog "Arquivo Criado: $path" "INFO"
+		            Write-Host "EVENTO: $type - $path" -ForegroundColor Cyan
+		            [Console]::Beep(600, 200)
+             }
+            "Changed" {
+            		Write-Host "CHANGED DISPAROU: $path" -ForegroundColor Cyan
+        
+            		$newHash = & $global:GetFileHashSafe $path
+            		if (-not $newHash) { return }
+        
+            		if (-not $global:baseline.ContainsKey($path)) {
+                		Write-Host "Arquivo não está no baseline ainda"
+                		return
+           		  }
+        
+            		if ($global:baseline[$path] -ne $newHash) {
+        
+                		$oldHash = $global:baseline[$path]
+                		$global:baseline[$path] = $newHash
+        
+                		if ($oldHash -and $newHash) {
+                    			$shortOld = $oldHash.Substring(0,8)
+                    			$shortNew = $newHash.Substring(0,8)
+                		} else {
+                    			$shortOld = "N/A"
+                    			$shortNew = "N/A"
+                		}
+        
+                	& $global:WriteLog "Modificação Detectada: $path | Hash Antigo: $shortOld... | Novo: $shortNew..." "WARNING"
+        
+                	Check-BehavioralAnomaly
+                	[Console]::Beep(600, 200)
+            		 }
+        	     }
+            "Deleted" {
+            	if ($global:baseline.ContainsKey($path)) {
+                	$global:baseline.Remove($path)
+                	& $global:WriteLog "Arquivo Removido: $path" "WARNING"
+			            Write-Host "EVENTO: $type - $path" -ForegroundColor Cyan
+                	[Console]::Beep(600, 200)
+            	  }
+              }
+            "Renamed" {
+            	$oldPath = $Event.SourceEventArgs.OldFullPath
+            	if ($global:baseline.ContainsKey($oldPath)) {
+    			      $global:baseline.Remove($oldPath)
+	    	      }
+            	$global:baseline[$path] = & $global:GetFileHashSafe $path
+            	& $global:WriteLog "Renomeado: $oldPath -> $path" "INFO"
+		          Write-Host "EVENTO: $type - $path" -ForegroundColor Cyan
+            }
+        }
+    }catch {
+        Write-Host "ERRO NO EVENTO: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+# Registrar Eventos
+"Created", "Changed", "Deleted", "Renamed" | ForEach-Object {
+    Register-ObjectEvent $watcher $_ -Action $action
+}
+
+# >> LOOPING <<
+Write-Host "Monitoramento em $directory..." -ForegroundColor Green
+
+try {
+    $saveCounter = 0
+    while ($true) {
+        Start-Sleep -Seconds 1
+        $saveCounter++
+        
+        # Salva o baseline a cada 30 segundos (evita I/O excessivo)
+        if ($saveCounter -ge 30) {
+            $global:baseline | ConvertTo-Json -Depth 5 | Set-Content $global:baselinePath
+            $saveCounter = 0
+        }
+    }
+} finally {
+    $watcher.Dispose()
+    Unregister-Event *
+    Write-Host "Script encerrado." -ForegroundColor Red
+}
